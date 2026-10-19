@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pendulum swing-up — MechLearning</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --border: #262b33;
+    --text: #e6e8eb;
+    --muted: #8a91a0;
+    --accent: #f27226;
+    --good: #35c97a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin: 0 0 4px;
+    color: var(--text);
+  }
+  header p {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  header a { color: var(--accent); text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+  main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  #stage-wrap {
+    flex: 1;
+    position: relative;
+    min-width: 0;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  aside {
+    width: 220px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .stat {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+  .stat-value {
+    font-size: 18px;
+    color: var(--text);
+  }
+  .stat-value.good { color: var(--good); }
+  .controls {
+    display: flex;
+    gap: 8px;
+    margin-top: auto;
+  }
+  button {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 2px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pendulum swing-up</h1>
+  <p>
+    A browser port of the <code>sandbox/easy/01_pendulum_swingup</code> lesson from
+    <a href="https://github.com/jparr95/MechLearning" target="_blank" rel="noopener noreferrer">MechLearning</a> —
+    same physics and controller, running in a canvas instead of MuJoCo's native viewer.
+    Energy-pump control far from upright, PD balance near it.
+  </p>
+</header>
+<main>
+  <div id="stage-wrap"><canvas id="stage"></canvas></div>
+  <aside>
+    <div>
+      <div class="stat">Angle from upright</div>
+      <div class="stat-value" id="stat-angle">—</div>
+    </div>
+    <div>
+      <div class="stat">Energy / target</div>
+      <div class="stat-value" id="stat-energy">—</div>
+    </div>
+    <div>
+      <div class="stat">Mode</div>
+      <div class="stat-value" id="stat-mode">—</div>
+    </div>
+    <div class="controls">
+      <button id="btn-pause">pause</button>
+      <button id="btn-reset">reset</button>
+    </div>
+  </aside>
+</main>
+
+<script>
+// Physics + controller ported directly from MechLearning's
+// sandbox/easy/01_pendulum_swingup/solution.py — same constants, same math.
+const G = 9.81, LENGTH = 0.5, MASS = 1.0, HINGE_DAMPING = 0.05;
+const TORQUE_LIMIT = 1.5;      // N*m — matches the lesson's motor limit
+const E_TOP = 2 * MASS * G * LENGTH;
+const PUMP_GAIN = 2.0;
+const BALANCE_REGION = 0.3;    // rad from upright
+const KP = 20.0, KD = 3.0;
+const START_ANGLE = 0.1;       // rad from straight down
+const DT = 0.002;              // matches pendulum.xml's option timestep
+
+function wrapAngle(a) {
+  return ((a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+}
+
+function energy(theta, omega) {
+  return 0.5 * MASS * LENGTH ** 2 * omega ** 2 + MASS * G * LENGTH * (1 - Math.cos(theta));
+}
+
+function swingTorque(theta, omega) {
+  return PUMP_GAIN * (E_TOP - energy(theta, omega)) * omega;
+}
+
+function balanceTorque(theta, omega) {
+  const error = wrapAngle(theta - Math.PI);
+  return -KP * error - KD * omega;
+}
+
+function controllerTorque(theta, omega) {
+  const inBalanceRegion = Math.abs(wrapAngle(theta - Math.PI)) < BALANCE_REGION;
+  const raw = inBalanceRegion ? balanceTorque(theta, omega) : swingTorque(theta, omega);
+  return { torque: Math.max(-TORQUE_LIMIT, Math.min(TORQUE_LIMIT, raw)), mode: inBalanceRegion ? "balance" : "swing" };
+}
+
+function accel(theta, omega, torque) {
+  // alpha = (u - m g L sin(theta) - b*omega) / (m L^2), see course/01_physics_sim.
+  return (torque - MASS * G * LENGTH * Math.sin(theta) - HINGE_DAMPING * omega) / (MASS * LENGTH ** 2);
+}
+
+let state = { theta: START_ANGLE, omega: 0.0 };
+let paused = false;
+let lastMode = "swing";
+
+function reset() {
+  state = { theta: START_ANGLE, omega: 0.0 };
+}
+
+function step() {
+  const { torque, mode } = controllerTorque(state.theta, state.omega);
+  lastMode = mode;
+  const alpha = accel(state.theta, state.omega, torque);
+  // semi-implicit Euler, as in course/01_physics_sim
+  state.omega += alpha * DT;
+  state.theta += state.omega * DT;
+}
+
+// --- rendering ---
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const wrap = document.getElementById("stage-wrap");
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = wrap.clientWidth * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function draw() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+
+  const cx = w / 2, cy = h * 0.42;
+  const pxPerM = Math.min(w, h) * 0.32 / LENGTH;
+
+  // theta = 0 is straight down; bob position relative to pivot:
+  const bobX = cx + LENGTH * pxPerM * Math.sin(state.theta);
+  const bobY = cy + LENGTH * pxPerM * Math.cos(state.theta);
+
+  // faint upright target line
+  ctx.strokeStyle = "rgba(53, 201, 122, 0.25)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 6]);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx, cy - LENGTH * pxPerM);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // rod
+  ctx.strokeStyle = "#d4d6db";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(bobX, bobY);
+  ctx.stroke();
+
+  // pivot
+  ctx.fillStyle = "#4b5160";
+  ctx.beginPath();
+  ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // bob
+  ctx.fillStyle = "#f27226";
+  ctx.beginPath();
+  ctx.arc(bobX, bobY, 14, 0, Math.PI * 2);
+  ctx.fill();
+
+  // HUD text
+  document.getElementById("stat-angle").textContent =
+    wrapAngle(state.theta - Math.PI).toFixed(3) + " rad";
+  document.getElementById("stat-angle").className =
+    "stat-value" + (Math.abs(wrapAngle(state.theta - Math.PI)) < 0.1 ? " good" : "");
+  document.getElementById("stat-energy").textContent =
+    energy(state.theta, state.omega).toFixed(2) + " / " + E_TOP.toFixed(2) + " J";
+  document.getElementById("stat-mode").textContent = lastMode;
+}
+
+function loop() {
+  if (!paused) {
+    // several physics substeps per animation frame to keep DT small and stable
+    for (let i = 0; i < 8; i++) step();
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+document.getElementById("btn-pause").addEventListener("click", (e) => {
+  paused = !paused;
+  e.target.textContent = paused ? "resume" : "pause";
+});
+document.getElementById("btn-reset").addEventListener("click", reset);
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
